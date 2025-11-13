@@ -34,8 +34,6 @@ import (
 
 const (
 	deviceCheckInterval = 5 * time.Second
-	// By default, GKE allows up to 110 Pods per node on Standard clusters. Standard clusters can be configured to allow up to 256 Pods per node.
-	workloadSharedLimit = 1
 )
 
 var (
@@ -48,6 +46,7 @@ type CcDeviceSpec struct {
 	Resource         string
 	DevicePaths      []string
 	MeasurementPaths []string
+	DeviceLimit      int // Number of allocatable instances of this resource
 }
 
 // CcDevice wraps the v1.beta1.Device type, which has hostPath, containerPath and permission
@@ -55,18 +54,16 @@ type CcDevice struct {
 	v1beta1.Device
 	DeviceSpecs []*v1beta1.DeviceSpec
 	Mounts      []*v1beta1.Mount
-	// Limit specifies the cap number of workloads sharing a worker node
-	Limit int
 }
 
 // CcDevicePlugin is a device plugin for cc devices
 type CcDevicePlugin struct {
-	cds                        *CcDeviceSpec
-	ccDevices                  map[string]CcDevice
+	cds                    *CcDeviceSpec
+	ccDevices              map[string]CcDevice
 	copiedEventLogDirectory    string
-	copiedEventLogLocation     string
+	copiedEventLogLocation     string // Shared location for the copied measurement file. Only used by the vTPM plugin.
 	containerEventLogDirectory string
-	logger                     log.Logger
+	logger                 log.Logger
 	// this lock prevents data race when kubelet sends multiple requests at the same time
 	mu sync.Mutex
 
@@ -80,13 +77,16 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
+	if cds.DeviceLimit <= 0 {
+		cds.DeviceLimit = 1 // Default to 1 if not specified
+	}
 
 	cdp := &CcDevicePlugin{
-		cds:                        cds,
-		ccDevices:                  make(map[string]CcDevice),
-		logger:                     logger,
+		cds:                    cds,
+		ccDevices:              make(map[string]CcDevice),
+		logger:                 logger,
 		copiedEventLogDirectory:    "/run/cc-device-plugin",
-		copiedEventLogLocation:     "/run/cc-device-plugin/binary_bios_measurements", // Note: This path is static, might need adjustment if multiple plugins copy files. For now it's OK as only TPM does.
+		copiedEventLogLocation:     "/run/cc-device-plugin/binary_bios_measurements", // Note: This path is static, used only by vTPM plugin instance.
 		containerEventLogDirectory: "/run/cc-device-plugin",
 		deviceGauge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "cc_device_plugin_devices",
@@ -106,7 +106,7 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 			if err != nil {
 				return nil, err
 			}
-			level.Info(cdp.logger).Log("msg", "Directory created for measurement files: "+cdp.copiedEventLogDirectory)
+			level.Info(cdp.logger).Log("msg", "Directory created for measurement files", "path", cdp.copiedEventLogDirectory)
 		}
 	}
 
@@ -138,15 +138,14 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 		return nil, nil
 	}
 
-	cd := CcDevice{
+	baseDevice := CcDevice{
 		Device: v1beta1.Device{
 			Health: v1beta1.Healthy,
 		},
-		Limit: 1,
 	}
 
 	for _, matchPath := range foundDevicePaths {
-		cd.DeviceSpecs = append(cd.DeviceSpecs, &v1beta1.DeviceSpec{
+		baseDevice.DeviceSpecs = append(baseDevice.DeviceSpecs, &v1beta1.DeviceSpec{
 			HostPath:      matchPath,
 			ContainerPath: matchPath,
 			Permissions:   "mrw",
@@ -168,9 +167,8 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 				break
 			}
 		}
-
 		if foundMeasurementPath != "" {
-			cd.Mounts = append(cd.Mounts, &v1beta1.Mount{
+			baseDevice.Mounts = append(baseDevice.Mounts, &v1beta1.Mount{
 				HostPath:      cdp.copiedEventLogDirectory,
 				ContainerPath: cdp.containerEventLogDirectory,
 				ReadOnly:      true,
@@ -182,21 +180,35 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 					level.Error(cdp.logger).Log("msg", "failed to copy measurement file", "error", err)
 					return nil, err
 				}
-			} else if fileInfo.ModTime().After(measurementFileLastUpdate) {
+			} else if err == nil && fileInfo.ModTime().After(measurementFileLastUpdate) {
 				if err := copyMeasurementFile(foundMeasurementPath, cdp.copiedEventLogLocation); err != nil {
 					level.Error(cdp.logger).Log("msg", "failed to re-copy measurement file", "error", err)
 					return nil, err
 				}
+			} else if err != nil {
+				level.Error(cdp.logger).Log("msg", "failed to stat copied measurement file", "error", err)
+				return nil, err
 			}
+		} else {
+			level.Warn(cdp.logger).Log("msg", "MeasurementPaths specified but no measurement file found", "paths", strings.Join(cdp.cds.MeasurementPaths, ","))
 		}
 	}
 
-	// If a device was found, create and return a single device entry.
-	// The ID is derived from the resource name for uniqueness.
+	// Create DeviceLimit instances of the device
 	h := sha1.New()
 	h.Write([]byte(cdp.cds.Resource))
-	cd.ID = fmt.Sprintf("%x", h.Sum(nil))
-	ccDevices = append(ccDevices, cd)
+	baseID := fmt.Sprintf("%x", h.Sum(nil))
+
+	for i := 0; i < cdp.cds.DeviceLimit; i++ {
+		cd := baseDevice // Copy the base structure
+		// For single-limit devices, ID is baseID. For multi-limit, append index.
+		if cdp.cds.DeviceLimit > 1 {
+			cd.ID = fmt.Sprintf("%s-%d", baseID, i)
+		} else {
+			cd.ID = baseID
+		}
+		ccDevices = append(ccDevices, cd)
+	}
 
 	return ccDevices, nil
 }
@@ -250,18 +262,28 @@ func (cdp *CcDevicePlugin) refreshDevices() (bool, error) {
 			devicesUnchange = false
 		}
 	}
-	if !devicesUnchange {
-		return false, nil
+	if len(ccDevices) != len(old) {
+		devicesUnchange = false
 	}
 
-	// Check if devices were removed.
+	if devicesUnchange {
+		return true, nil
+	}
+
+	// Log if devices were removed
 	for k := range old {
 		if _, ok := cdp.ccDevices[k]; !ok {
-			level.Warn(cdp.logger).Log("msg", "devices removed")
-			return false, nil
+			level.Info(cdp.logger).Log("msg", "device removed", "id", k)
 		}
 	}
-	return true, nil
+	// Log if devices were added
+	for k := range cdp.ccDevices {
+		if _, ok := old[k]; !ok {
+			level.Info(cdp.logger).Log("msg", "device added", "id", k)
+		}
+	}
+
+	return false, nil
 }
 
 // Allocate assigns cc devices to a Pod.
@@ -282,19 +304,18 @@ func (cdp *CcDevicePlugin) Allocate(_ context.Context, req *v1beta1.AllocateRequ
 			if ccDevice.Health != v1beta1.Healthy {
 				return nil, fmt.Errorf("requested cc device is not healthy %q", id)
 			}
-			level.Info(cdp.logger).Log("msg", "adding device and measurement to Pod, device id is:"+id)
+			level.Info(cdp.logger).Log("msg", "adding device and measurement to Pod", "device id", id)
 
 			for _, ds := range ccDevice.DeviceSpecs {
-				level.Info(cdp.logger).Log("msg", "added ccDevice.deviceSpecs is:"+ds.String())
+				level.Debug(cdp.logger).Log("msg", "added ccDevice.deviceSpecs", "spec", ds.String())
 			}
 
 			for _, dm := range ccDevice.Mounts {
-				level.Info(cdp.logger).Log("msg", "added ccDevice.mounts is:"+dm.String())
+				level.Debug(cdp.logger).Log("msg", "added ccDevice.mounts", "mount", dm.String())
 			}
 
 			resp.Devices = append(resp.Devices, ccDevice.DeviceSpecs...)
 			resp.Mounts = append(resp.Mounts, ccDevice.Mounts...)
-
 		}
 		res.ContainerResponses = append(res.ContainerResponses, resp)
 	}
@@ -313,22 +334,25 @@ func (cdp *CcDevicePlugin) ListAndWatch(_ *v1beta1.Empty, stream v1beta1.DeviceP
 	if _, err := cdp.refreshDevices(); err != nil {
 		return err
 	}
-	refreshComplete := false
-	var err error
+
 	for {
-		if !refreshComplete {
-			res := new(v1beta1.ListAndWatchResponse)
-			for _, dev := range cdp.ccDevices {
-				res.Devices = append(res.Devices, &v1beta1.Device{ID: dev.ID, Health: dev.Health})
-			}
-			if err := stream.Send(res); err != nil {
-				return err
-			}
+		res := new(v1beta1.ListAndWatchResponse)
+		cdp.mu.Lock()
+		for _, dev := range cdp.ccDevices {
+			res.Devices = append(res.Devices, &v1beta1.Device{ID: dev.ID, Health: dev.Health})
 		}
-		<-time.After(deviceCheckInterval)
-		refreshComplete, err = cdp.refreshDevices()
-		if err != nil {
+		cdp.mu.Unlock()
+
+		if err := stream.Send(res); err != nil {
+			level.Error(cdp.logger).Log("msg", "failed to send ListAndWatchResponse", "error", err)
 			return err
+		}
+
+		<-time.After(deviceCheckInterval)
+
+		if _, err := cdp.refreshDevices(); err != nil {
+			level.Error(cdp.logger).Log("msg", "error during device refresh", "error", err)
+			// Don't return error immediately, try to continue
 		}
 	}
 }

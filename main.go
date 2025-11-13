@@ -67,6 +67,7 @@ func Main() error {
 			Resource:         "google.com/cc",
 			DevicePaths:      []string{"/dev/tpmrm0"},
 			MeasurementPaths: []string{"/sys/kernel/security/tpm0/binary_bios_measurements"},
+			DeviceLimit:      256, // Allow multiple pods to share the vTPM
 		},
 		{
 			// Intel TDX
@@ -74,6 +75,7 @@ func Main() error {
 			DevicePaths: []string{"/dev/tdx-guest", "/dev/tdx_guest"}, // Some kernels use different names
 			// TDX does not have a separate measurement file, attestation is done via ioctl.
 			MeasurementPaths: []string{},
+			DeviceLimit:      1, // Only one container can use the TDX device at a time per node
 		},
 		{
 			// AMD SEV-SNP
@@ -81,11 +83,14 @@ func Main() error {
 			DevicePaths: []string{"/dev/sev-guest"},
 			// SEV-SNP also uses ioctl for attestation.
 			MeasurementPaths: []string{},
+			DeviceLimit:      1, // Only one container can use the SEV-SNP device at a time per node
 		},
 	}
 
 	devicePluginPath := v1beta1.DevicePluginPath
+	socketPrefix := "cc-device-plugin"
 
+	// by default, only track warning and error log
 	logLevel := flag.String("log-level", logLevelWarn, fmt.Sprintf("Log level available values: %s", availableLogLevels))
 	listen := flag.String("listen", ":8080", "The listening port for health and metrics.")
 	flag.Parse()
@@ -115,6 +120,18 @@ func Main() error {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+
+	// Defer socket cleanup
+	defer func() {
+		level.Info(logger).Log("msg", "Cleaning up potential socket files")
+		for _, spec := range allDeviceSpecs {
+			safeResourceName := strings.ReplaceAll(spec.Resource, "/", "-")
+			socketPath := filepath.Join(devicePluginPath, fmt.Sprintf("%s-%s.sock", socketPrefix, safeResourceName))
+			if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+				level.Warn(logger).Log("msg", "Failed to remove socket file", "path", socketPath, "error", err)
+			}
+		}
+	}()
 
 	var g run.Group
 	{
@@ -162,26 +179,25 @@ func Main() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	pluginCreationErrors := false
 	// The run.Group `g` will manage all of them concurrently.
 	for _, spec := range allDeviceSpecs {
 		// Use a local variable for the spec in the closure
 		ccDeviceSpec := spec
-		socketPrefix := "cc-device-plugin"
-		// Create a unique socket name for each resource type
 		safeResourceName := strings.ReplaceAll(ccDeviceSpec.Resource, "/", "-")
 		socket := filepath.Join(devicePluginPath, fmt.Sprintf("%s-%s.sock", socketPrefix, safeResourceName))
 
 		// Create a new device plugin instance for the current device spec
 		tp, err := deviceplugin.NewCcDevicePlugin(ccDeviceSpec, devicePluginPath, socket, log.With(logger, "resource", ccDeviceSpec.Resource), prometheus.WrapRegistererWith(prometheus.Labels{"resource": ccDeviceSpec.Resource}, r))
 		if err != nil {
-			// Log the error but don't stop, so other plugins can still start
 			level.Error(logger).Log("msg", "Failed to create new device plugin", "resource", ccDeviceSpec.Resource, "error", err)
+			pluginCreationErrors = true // Mark that at least one plugin failed
 			continue
 		}
 
 		// Add the device plugin server to the run.Group
 		g.Add(func() error {
-			level.Info(logger).Log("msg", fmt.Sprintf("Starting the cc-device-plugin for %q.", ccDeviceSpec.Resource))
+			level.Info(logger).Log("msg", "Starting the cc-device-plugin", "resource", ccDeviceSpec.Resource)
 			return tp.Run(ctx)
 		}, func(error) {
 			// This will be called on shutdown, ensuring the context is cancelled for this plugin instance.
@@ -189,7 +205,15 @@ func Main() error {
 		})
 	}
 
-	return g.Run()
+	if err := g.Run(); err != nil {
+		return err
+	}
+
+	if pluginCreationErrors {
+		return fmt.Errorf("one or more device plugins failed to initialize")
+	}
+
+	return nil
 }
 
 func main() {
