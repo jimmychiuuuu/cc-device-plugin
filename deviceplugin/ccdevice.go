@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,7 +35,7 @@ import (
 const (
 	deviceCheckInterval = 5 * time.Second
 	// By default, GKE allows up to 110 Pods per node on Standard clusters. Standard clusters can be configured to allow up to 256 Pods per node.
-	workloadSharedLimit = 256
+	workloadSharedLimit = 1
 )
 
 var (
@@ -85,7 +86,7 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 		ccDevices:                  make(map[string]CcDevice),
 		logger:                     logger,
 		copiedEventLogDirectory:    "/run/cc-device-plugin",
-		copiedEventLogLocation:     "/run/cc-device-plugin/binary_bios_measurements",
+		copiedEventLogLocation:     "/run/cc-device-plugin/binary_bios_measurements", // Note: This path is static, might need adjustment if multiple plugins copy files. For now it's OK as only TPM does.
 		containerEventLogDirectory: "/run/cc-device-plugin",
 		deviceGauge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "cc_device_plugin_devices",
@@ -97,16 +98,16 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 		}),
 	}
 
-	// Check if the copiedEventLogDirectory directory exists
-	if _, err := os.Stat(cdp.copiedEventLogDirectory); os.IsNotExist(err) {
-		// Create the directory
-		err = os.Mkdir(cdp.copiedEventLogDirectory, 0755)
-		if err != nil {
-			return nil, err
+	if len(cdp.cds.MeasurementPaths) > 0 {
+		// Check if the copiedEventLogDirectory directory exists
+		if _, err := os.Stat(cdp.copiedEventLogDirectory); os.IsNotExist(err) {
+			// Create the directory
+			err = os.MkdirAll(cdp.copiedEventLogDirectory, 0755) // Use MkdirAll for safety
+			if err != nil {
+				return nil, err
+			}
+			level.Info(cdp.logger).Log("msg", "Directory created for measurement files: "+cdp.copiedEventLogDirectory)
 		}
-		level.Info(cdp.logger).Log("msg", "Directory created:"+cdp.copiedEventLogDirectory)
-	} else {
-		level.Info(cdp.logger).Log("msg", "Directory already exists:"+cdp.copiedEventLogDirectory)
 	}
 
 	if reg != nil {
@@ -118,70 +119,84 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 
 func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 	var ccDevices []CcDevice
-	cd := CcDevice{
-		Device: v1beta1.Device{
-			Health: v1beta1.Healthy,
-		},
-		// set cap
-		Limit: workloadSharedLimit,
-	}
-	h := sha1.New()
+	var foundDevicePaths []string
+
 	for _, path := range cdp.cds.DevicePaths {
 		matches, err := filepath.Glob(path)
 		if err != nil {
 			return nil, err
 		}
-		for _, matchPath := range matches {
-			level.Info(cdp.logger).Log("msg", "device path found:"+matchPath)
-			cd.DeviceSpecs = append(cd.DeviceSpecs, &v1beta1.DeviceSpec{
-				HostPath:      matchPath,
-				ContainerPath: matchPath,
-				Permissions:   "mrw",
-			})
+		if len(matches) > 0 {
+			level.Info(cdp.logger).Log("msg", "found matching device path(s)", "pattern", path, "matches", strings.Join(matches, ","))
+			foundDevicePaths = append(foundDevicePaths, matches...)
 		}
 	}
 
-	for _, path := range cdp.cds.MeasurementPaths {
-		matches, err := filepath.Glob(path)
-		if err != nil {
-			return nil, err
+	// If no device paths were found for this resource type, simply return an empty list.
+	// This is not an error; the node just doesn't have this specific hardware.
+	if len(foundDevicePaths) == 0 {
+		return nil, nil
+	}
+
+	cd := CcDevice{
+		Device: v1beta1.Device{
+			Health: v1beta1.Healthy,
+		},
+		Limit: 1,
+	}
+
+	for _, matchPath := range foundDevicePaths {
+		cd.DeviceSpecs = append(cd.DeviceSpecs, &v1beta1.DeviceSpec{
+			HostPath:      matchPath,
+			ContainerPath: matchPath,
+			Permissions:   "mrw",
+		})
+	}
+
+	// Only execute this block if MeasurementPaths are specified for the device.
+	if len(cdp.cds.MeasurementPaths) > 0 {
+		var foundMeasurementPath string
+		for _, path := range cdp.cds.MeasurementPaths {
+			matches, err := filepath.Glob(path)
+			if err != nil {
+				return nil, err
+			}
+			if len(matches) > 0 {
+				// We only expect one measurement file
+				foundMeasurementPath = matches[0]
+				level.Info(cdp.logger).Log("msg", "measurement path found", "path", foundMeasurementPath)
+				break
+			}
 		}
-		for _, matchPath := range matches {
-			level.Info(cdp.logger).Log("msg", "measurement path found:"+matchPath)
+
+		if foundMeasurementPath != "" {
 			cd.Mounts = append(cd.Mounts, &v1beta1.Mount{
 				HostPath:      cdp.copiedEventLogDirectory,
 				ContainerPath: cdp.containerEventLogDirectory,
 				ReadOnly:      true,
 			})
 
-			// copy when no measurement file at copiedEventLogLocation
 			fileInfo, err := os.Stat(cdp.copiedEventLogLocation)
 			if errors.Is(err, os.ErrNotExist) {
-				err := copyMeasurementFile(matchPath, cdp.copiedEventLogLocation)
-				if err != nil {
+				if err := copyMeasurementFile(foundMeasurementPath, cdp.copiedEventLogLocation); err != nil {
+					level.Error(cdp.logger).Log("msg", "failed to copy measurement file", "error", err)
 					return nil, err
 				}
-			} else {
-				// copy when measurement file at /run was updated, but not by the current instance.
-				// measurementFileLastUpdate is init to 0.
-				// when file exists during first run, this instance deletes and creates a new file
-				if fileInfo.ModTime().After(measurementFileLastUpdate) {
-					err := copyMeasurementFile(matchPath, cdp.copiedEventLogLocation)
-					if err != nil {
-						return nil, err
-					}
+			} else if fileInfo.ModTime().After(measurementFileLastUpdate) {
+				if err := copyMeasurementFile(foundMeasurementPath, cdp.copiedEventLogLocation); err != nil {
+					level.Error(cdp.logger).Log("msg", "failed to re-copy measurement file", "error", err)
+					return nil, err
 				}
 			}
 		}
 	}
-	if cd.DeviceSpecs != nil {
-		for i := 0; i < cd.Limit; i++ {
-			b := make([]byte, 1)
-			b[0] = byte(i)
-			cd.ID = fmt.Sprintf("%x", h.Sum(b))
-			ccDevices = append(ccDevices, cd)
-		}
-	}
+
+	// If a device was found, create and return a single device entry.
+	// The ID is derived from the resource name for uniqueness.
+	h := sha1.New()
+	h.Write([]byte(cdp.cds.Resource))
+	cd.ID = fmt.Sprintf("%x", h.Sum(nil))
+	ccDevices = append(ccDevices, cd)
 
 	return ccDevices, nil
 }
