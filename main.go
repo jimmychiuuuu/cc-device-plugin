@@ -65,6 +65,7 @@ func Main() error {
 		{
 			// vTPM for standard Confidential VMs
 			Resource:         "google.com/cc",
+			Type:             deviceplugin.SoftwareAttestation, // Explicitly marked as software
 			DevicePaths:      []string{"/dev/tpmrm0"},
 			MeasurementPaths: []string{"/sys/kernel/security/tpm0/binary_bios_measurements"},
 			DeviceLimit:      256, // Allow multiple pods to share the vTPM
@@ -72,6 +73,7 @@ func Main() error {
 		{
 			// Intel TDX
 			Resource:    "intel.com/tdx",
+			Type:        deviceplugin.HardwareAttestation, // Explicitly marked as hardware
 			DevicePaths: []string{"/dev/tdx-guest", "/dev/tdx_guest"}, // Some kernels use different names
 			// TDX does not have a separate measurement file, attestation is done via ioctl.
 			MeasurementPaths: []string{},
@@ -80,6 +82,7 @@ func Main() error {
 		{
 			// AMD SEV-SNP
 			Resource:    "amd.com/sev-snp",
+			Type:        deviceplugin.HardwareAttestation, // Explicitly marked as hardware
 			DevicePaths: []string{"/dev/sev-guest"},
 			// SEV-SNP also uses ioctl for attestation.
 			MeasurementPaths: []string{},

@@ -39,6 +39,14 @@ const (
 	containerEventLogDirectory = "/run/cc-device-plugin"
 )
 
+// AttestationType defines if the attestation is based on software emulation or hardware.
+type AttestationType string
+
+const (
+	SoftwareAttestation AttestationType = "software" // e.g., vTPM
+	HardwareAttestation AttestationType = "hardware" // e.g., Intel TDX, AMD SEV-SNP
+)
+
 var (
 	measurementFileLastUpdate time.Time
 )
@@ -50,6 +58,7 @@ type CcDeviceSpec struct {
 	DevicePaths      []string
 	MeasurementPaths []string
 	DeviceLimit      int // Number of allocatable instances of this resource
+	Type             AttestationType // New flag to explicitly define the device type
 }
 
 // CcDevice wraps the v1.beta1.Device type, which has hostPath, containerPath and permission
@@ -101,15 +110,18 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 		}),
 	}
 
-	if len(cdp.cds.MeasurementPaths) > 0 {
-		// Check if the copiedEventLogDirectory directory exists
+	// Only create the directory if the device type is software-based (e.g., vTPM),
+	// as hardware-based devices (TDX/SNP) do not require copying measurement files to /run.
+	if cdp.cds.Type == SoftwareAttestation {
 		if _, err := os.Stat(cdp.copiedEventLogDirectory); os.IsNotExist(err) {
 			// Create the directory
-			err = os.MkdirAll(cdp.copiedEventLogDirectory, 0755) // Use MkdirAll for safety
+			err = os.MkdirAll(cdp.copiedEventLogDirectory, 0755)
 			if err != nil {
 				return nil, err
 			}
-			level.Info(cdp.logger).Log("msg", "Directory created for measurement files", "path", cdp.copiedEventLogDirectory)
+			level.Info(cdp.logger).Log("msg", "Directory created:" + cdp.copiedEventLogDirectory)
+		} else {
+			level.Info(cdp.logger).Log("msg", "Directory already exists:" + cdp.copiedEventLogDirectory)
 		}
 	}
 
@@ -124,6 +136,8 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 	var ccDevices []CcDevice
 	var foundDevicePaths []string
 
+	// We use foundDevicePaths as an accumulator because a single resource (like TDX)
+	// might be represented by multiple device path patterns.
 	for _, path := range cdp.cds.DevicePaths {
 		matches, err := filepath.Glob(path)
 		if err != nil {
@@ -155,8 +169,8 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 		})
 	}
 
-	// Only execute this block if MeasurementPaths are specified for the device.
-	if len(cdp.cds.MeasurementPaths) > 0 {
+	// Measurement files are currently only expected for software-emulated devices (vTPM).
+	if cdp.cds.Type == SoftwareAttestation && len(cdp.cds.MeasurementPaths) > 0 {
 		var foundMeasurementPath string
 		for _, path := range cdp.cds.MeasurementPaths {
 			matches, err := filepath.Glob(path)
@@ -184,6 +198,7 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 					return nil, err
 				}
 			} else if err == nil && fileInfo.ModTime().After(measurementFileLastUpdate) {
+				// Refresh the copy if the source file has been updated by the kernel since the last copy.
 				if err := copyMeasurementFile(foundMeasurementPath, cdp.copiedEventLogLocation); err != nil {
 					level.Error(cdp.logger).Log("msg", "failed to re-copy measurement file", "error", err)
 					return nil, err
@@ -217,6 +232,11 @@ func (cdp *CcDevicePlugin) discoverCcDevices() ([]CcDevice, error) {
 }
 
 func copyMeasurementFile(src string, dest string) error {
+	// get time for src
+	sourceInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
 	// copy out measurement
 	eventlogFile, err := os.ReadFile(src)
 	if err != nil {
@@ -231,11 +251,7 @@ func copyMeasurementFile(src string, dest string) error {
 	if err != nil {
 		return err
 	}
-	fileInfo, err := os.Stat(dest)
-	if err != nil {
-		return err
-	}
-	measurementFileLastUpdate = fileInfo.ModTime()
+	measurementFileLastUpdate = sourceInfo.ModTime()
 	return nil
 }
 
