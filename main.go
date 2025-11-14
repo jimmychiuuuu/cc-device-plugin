@@ -188,7 +188,7 @@ func Main() error {
 		socket := filepath.Join(devicePluginPath, fmt.Sprintf("%s-%s.sock", socketPrefix, safeResourceName))
 
 		// Create a new device plugin instance for the current device spec
-		tp, err := deviceplugin.NewCcDevicePlugin(ccDeviceSpec, devicePluginPath, socket, log.With(logger, "resource", ccDeviceSpec.Resource), prometheus.WrapRegistererWith(prometheus.Labels{"resource": ccDeviceSpec.Resource}, r))
+		p, err := deviceplugin.NewCcDevicePlugin(ccDeviceSpec, devicePluginPath, socket, log.With(logger, "resource", ccDeviceSpec.Resource), prometheus.WrapRegistererWith(prometheus.Labels{"resource": ccDeviceSpec.Resource}, r))
 		if err != nil {
 			level.Error(logger).Log("msg", "Failed to create new device plugin", "resource", ccDeviceSpec.Resource, "error", err)
 			pluginCreationErrors = true // Mark that at least one plugin failed
@@ -198,7 +198,7 @@ func Main() error {
 		// Add the device plugin server to the run.Group
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "Starting the cc-device-plugin", "resource", ccDeviceSpec.Resource)
-			return tp.Run(ctx)
+			return p.Run(ctx)
 		}, func(error) {
 			// This will be called on shutdown, ensuring the context is cancelled for this plugin instance.
 			cancel()

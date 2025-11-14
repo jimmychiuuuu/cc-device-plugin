@@ -33,7 +33,10 @@ import (
 )
 
 const (
-	deviceCheckInterval = 5 * time.Second
+	deviceCheckInterval      = 5 * time.Second
+	copiedEventLogDirectory    = "/run/cc-device-plugin"
+	copiedEventLogLocation     = "/run/cc-device-plugin/binary_bios_measurements"
+	containerEventLogDirectory = "/run/cc-device-plugin"
 )
 
 var (
@@ -85,9 +88,9 @@ func NewCcDevicePlugin(cds *CcDeviceSpec, devicePluginPath string, socket string
 		cds:                    cds,
 		ccDevices:              make(map[string]CcDevice),
 		logger:                 logger,
-		copiedEventLogDirectory:    "/run/cc-device-plugin",
-		copiedEventLogLocation:     "/run/cc-device-plugin/binary_bios_measurements", // Note: This path is static, used only by vTPM plugin instance.
-		containerEventLogDirectory: "/run/cc-device-plugin",
+		copiedEventLogDirectory:    copiedEventLogDirectory,
+		copiedEventLogLocation:     copiedEventLogLocation, // Note: This path is static, used only by vTPM plugin instance.
+		containerEventLogDirectory: containerEventLogDirectory,
 		deviceGauge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "cc_device_plugin_devices",
 			Help: "The number of cc devices managed by this device plugin.",
