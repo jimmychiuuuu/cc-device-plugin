@@ -93,7 +93,9 @@ func constructTestPlugin(t *testing.T, spec *CcDeviceSpec) *CcDevicePlugin {
 
 	// For SoftwareAttestation, we expect the directory to be created
 	if spec.Type == SoftwareAttestation {
-		os.MkdirAll(cdp.copiedEventLogDirectory, 0755)
+		if err := os.MkdirAll(cdp.copiedEventLogDirectory, 0755); err != nil {
+			t.Fatalf("failed to create directory: %v", err)
+		}
 	}
 
 	return cdp
@@ -223,7 +225,9 @@ func TestAllocate(t *testing.T) {
 		DeviceLimit:      2,
 	}
 	cdp := constructTestPlugin(t, spec)
-	cdp.refreshDevices()
+	if _, err := cdp.refreshDevices(); err != nil {
+		t.Fatalf("refreshDevices failed: %v", err)
+	}
 
 	ctx := context.Background()
 	expectedID := getExpectedID(spec.Resource, spec.DeviceLimit, 0)
@@ -259,10 +263,8 @@ func TestAllocateNotExistDevice(t *testing.T) {
 		}},
 	}
 	_, err := cdp.Allocate(context.Background(), req)
-	if err == nil || !errors.Is(err, err) { // Simplified check for existence of error
-		if !errors.Is(err, fmt.Errorf("requested cc device does not exist \"NonExistentID\"")) {
-			// Logic check passed if error contains the string
-		}
+	if err == nil {
+		t.Fatal("expected error for non-existent device, got nil")
 	}
 }
 
@@ -277,13 +279,13 @@ func (d *listAndWatchServerStub) Send(*v1beta1.ListAndWatchResponse) error {
 	return nil
 }
 
-func (d *listAndWatchServerStub) SetTestComplete() { d.testComplete = true }
-func (d *listAndWatchServerStub) SetHeader(metadata.MD) error { return nil }
+func (d *listAndWatchServerStub) SetTestComplete()             { d.testComplete = true }
+func (d *listAndWatchServerStub) SetHeader(metadata.MD) error  { return nil }
 func (d *listAndWatchServerStub) SendHeader(metadata.MD) error { return nil }
-func (d *listAndWatchServerStub) SetTrailer(metadata.MD) {}
-func (d *listAndWatchServerStub) Context() context.Context { return context.Background() }
-func (d *listAndWatchServerStub) SendMsg(any) error { return nil }
-func (d *listAndWatchServerStub) RecvMsg(any) error { return nil }
+func (d *listAndWatchServerStub) SetTrailer(metadata.MD)       { /* no-op for testing */ }
+func (d *listAndWatchServerStub) Context() context.Context     { return context.Background() }
+func (d *listAndWatchServerStub) SendMsg(any) error            { return nil }
+func (d *listAndWatchServerStub) RecvMsg(any) error            { return nil }
 
 func TestListAndWatch(t *testing.T) {
 	spec := &CcDeviceSpec{
@@ -321,5 +323,7 @@ func TestListAndWatch(t *testing.T) {
 		}, func(error) {})
 	}
 
-	g.Run()
+	if err := g.Run(); err != nil && err.Error() != "test complete" {
+		t.Errorf("run group failed: %v", err)
+	}
 }
