@@ -73,7 +73,7 @@ func Main() error {
 		{
 			// Intel TDX
 			Resource:    "intel.com/tdx",
-			Type:        deviceplugin.HardwareAttestation, // Explicitly marked as hardware
+			Type:        deviceplugin.HardwareAttestation,             // Explicitly marked as hardware
 			DevicePaths: []string{"/dev/tdx-guest", "/dev/tdx_guest"}, // Some kernels use different names
 			// TDX does not have a separate measurement file, attestation is done via ioctl.
 			MeasurementPaths: []string{},
@@ -126,12 +126,12 @@ func Main() error {
 
 	// Defer socket cleanup
 	defer func() {
-		level.Info(logger).Log("msg", "Cleaning up potential socket files")
+		_ = level.Info(logger).Log("msg", "Cleaning up potential socket files")
 		for _, spec := range allDeviceSpecs {
 			safeResourceName := strings.ReplaceAll(spec.Resource, "/", "-")
 			socketPath := filepath.Join(devicePluginPath, fmt.Sprintf("%s-%s.sock", socketPrefix, safeResourceName))
 			if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-				level.Warn(logger).Log("msg", "Failed to remove socket file", "path", socketPath, "error", err)
+				_ = level.Warn(logger).Log("msg", "Failed to remove socket file", "path", socketPath, "error", err)
 			}
 		}
 	}()
@@ -168,7 +168,7 @@ func Main() error {
 			for {
 				select {
 				case <-term:
-					level.Info(logger).Log("msg", "caught interrupt; gracefully cleaning up; see you next time!")
+					_ = level.Info(logger).Log("msg", "caught interrupt; gracefully cleaning up; see you next time!")
 					return nil
 				case <-cancel:
 					return nil
@@ -193,14 +193,14 @@ func Main() error {
 		// Create a new device plugin instance for the current device spec
 		p, err := deviceplugin.NewCcDevicePlugin(ccDeviceSpec, devicePluginPath, socket, log.With(logger, "resource", ccDeviceSpec.Resource), prometheus.WrapRegistererWith(prometheus.Labels{"resource": ccDeviceSpec.Resource}, r))
 		if err != nil {
-			level.Error(logger).Log("msg", "Failed to create new device plugin", "resource", ccDeviceSpec.Resource, "error", err)
+			_ = level.Error(logger).Log("msg", "Failed to create new device plugin", "resource", ccDeviceSpec.Resource, "error", err)
 			pluginCreationErrors = true // Mark that at least one plugin failed
 			continue
 		}
 
 		// Add the device plugin server to the run.Group
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "Starting the cc-device-plugin", "resource", ccDeviceSpec.Resource)
+			_ = level.Info(logger).Log("msg", "Starting the cc-device-plugin", "resource", ccDeviceSpec.Resource)
 			return p.Run(ctx)
 		}, func(error) {
 			// This will be called on shutdown, ensuring the context is cancelled for this plugin instance.
